@@ -23,6 +23,8 @@ import struct
 import inspect
 from contextlib import nullcontext
 from dataclasses import dataclass
+import ipdb
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -465,6 +467,7 @@ def write_model(model, filename, dtype):
     # 2) the parameters follow the header
     params = {name: param.cpu() for name, param in model.named_parameters()}
     # pad the vocab to a multiple of 128 here at export, for efficiency in C
+    # ipdb.set_trace()
     wte = params["transformer.wte.weight"] # (V, C)
     wte_padded = pad_vocab(wte) # (Vp, C)
     params["transformer.wte.weight"] = wte_padded # (Vp, C)
@@ -546,6 +549,11 @@ if __name__ == "__main__":
     parser.add_argument("--input_val_bin", type=str, default="", help="input .bin to eval validation loss on")
     parser.add_argument("--output_dir", type=str, default="", help="output directory to which to write logs and checkpoints")
     parser.add_argument("--model", type=str, default="gpt2", help="gpt2|gpt2-medium|gpt2-large|gpt2-xl|d12|d24|d36|d48")
+
+    # checkpoints
+    parser.add_argument("--checkpoint_every", type=int, default=0, help="write checkpoints every how many steps?")
+    parser.add_argument("--checkpoint_keep", type=int, default=0, help="how long checkpoint histry do we keep? (in units of checkpoints)")
+    parser.add_argument("--major_checkpoint_every", type=int, default=0, help="major checkpoints never get deleted")
     # token layout for each step of the optimization
     parser.add_argument("--batch_size", type=int, default=4, help="batch size, in units of #batch dimensions")
     parser.add_argument("--sequence_length", type=int, default=64, help="sequence length")
@@ -620,8 +628,13 @@ if __name__ == "__main__":
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
+    if (args.total_batch_size == -1):
+        args.total_batch_size = tokens_per_fwdbwd
+
+    # ipdb.set_trace()
     assert args.total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
+
     print0(f"total desired batch size: {args.total_batch_size}")
     print0(f"=> calculated gradient accumulation steps: {grad_accum_steps}")
 
@@ -663,6 +676,7 @@ if __name__ == "__main__":
         model = GPT.from_pretrained(args.model)
     model.train()
     model.to(device)
+    # ipdb.set_trace()
     if args.compile:
         if hasattr(config, "coordinate_descent_tuning"):
             config.coordinate_descent_tuning = True # suggested by @Chillee
@@ -674,6 +688,11 @@ if __name__ == "__main__":
 
     # load tokens
     train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
+
+    if args.num_iterations == -1:
+        # train for one epoch
+        args.num_iterations = train_loader.ntok_total // args.total_batch_size
+    # ipdb.set_trace()
     val_loader = None
     if args.input_val_bin:
         val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
@@ -740,6 +759,8 @@ if __name__ == "__main__":
         torch.cuda.reset_peak_memory_stats()
     timings = []
     norm = -1.0   # dummy value to print in inference-only mode
+
+    num_iterations = train_loader.ntok_total // B;
     for step in range(args.num_iterations + 1):
         t0 = time.time()
         last_step = (step == args.num_iterations)
@@ -785,6 +806,17 @@ if __name__ == "__main__":
         # but also after the very last iteration. so we loop for step <= num_iterations
         # instead of just < num_iterations (one extra due to <=), only to do
         # the validation/sampling one last time, and then we break right here as we're done.
+        
+        # once in a while checkpoint the optimization state (all ranks)
+        if (args.checkpoint_every > 0 \
+            and (step % args.checkpoint_every==0 or last_step)):
+            write_model(model, f"{args.output_dir}/gpt2_{model_size_str}_{step}.bin", dtype="float32")
+            write_model(model, f"{args.output_dir}/gpt2_{model_size_str}_bf16_{step}.bin", dtype="bfloat16")
+            step_delete = step - args.checkpoint_keep * args.checkpoint_every
+            if args.checkpoint_keep > 0 and step_delete > 0 and \
+                (args.major_checkpoint_every == 0 or step_delete % args.major_checkpoint_every != 0):
+                Path(args.output_dir, f"gpt2_{model_size_str}_{step_delete}.bin").unlink(missing_ok=True)
+                Path(args.output_dir, f"gpt2_{model_size_str}_bf16_{step_delete}.bin").unlink(missing_ok=True)
         if last_step:
             break
 
