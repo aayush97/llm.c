@@ -50,6 +50,80 @@ class NewGELU(nn.Module):
 # using a global to toggle flash-attention
 FLASH = 0
 
+class RotaryEmbedding(nn.Module):
+    inv_freq: torch.Tensor  # fix linting for `register_buffer`
+    ROPE_THETA = 10_000
+
+
+    def __init__(self, config, device=None):
+        super().__init__()
+        # # BC: "rope_type" was originally "type"
+        # if hasattr(config, "rope_scaling") and isinstance(config.rope_scaling, dict):
+        #     self.rope_type = config.rope_scaling.get("rope_type", config.rope_scaling.get("type"))
+        # else:
+        #     self.rope_type = "default"
+        self.max_seq_len_cached = 2048
+        self.original_max_seq_len = 2048
+
+        # self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq = self.compute_rope_parameters(config, device)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+    
+    def compute_rope_parameters(self, config, device=None):
+        base = self.ROPE_THETA
+        dim = config.n_embd // config.n_head
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(device=device, dtype=torch.float) / dim))
+        return inv_freq
+    
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1).to(x.device)
+        position_ids_expanded = position_ids[:, None, :].float()
+
+        device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):  # Force float32
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos() 
+            sin = emb.sin()
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
 class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
@@ -67,7 +141,7 @@ class CausalSelfAttention(nn.Module):
         self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                      .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, position_embeddings):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         qkv = self.c_attn(x)
@@ -75,6 +149,9 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
+        cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb(q, k, cos, sin)
         if FLASH:
             # flashattention
             y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
@@ -114,8 +191,8 @@ class Block(nn.Module):
         self.ln_2 = nn.RMSNorm(config.n_embd, eps=1e-6)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, position_embeddings):
+        x = x + self.attn(self.ln_1(x), position_embeddings)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -138,7 +215,8 @@ class GPT(nn.Module):
 
         self.transformer = nn.ModuleDict(dict(
             wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
+            # wpe = nn.Embedding(config.block_size, config.n_embd),
+            rope_emb = RotaryEmbedding(config),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
             ln_f = nn.LayerNorm(config.n_embd),
         ))
@@ -172,11 +250,15 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
-        x = tok_emb + pos_emb
-
+        # pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        # x = tok_emb + pos_emb
+        x = tok_emb
+        position_ids = torch.arange(
+                0, x.shape[1], device=x.device
+            ).unsqueeze(0)
+        position_embeddings = self.transformer.rope_emb(x, position_ids)
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, position_embeddings)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -402,11 +484,11 @@ def write_tensors(model_tensors, L, file, dtype):
     assert dtype in {"float32", "bfloat16"}
     write_fun = write_fp32 if dtype == "float32" else write_bf16
     write_fun(model_tensors["transformer.wte.weight"], file) # (V, C)
-    write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
+    # write_fun(model_tensors["transformer.wpe.weight"], file) # (T, C)
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_1.weight"], file)
-    for i in range(L): # (L, C)
-        write_fun(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
+    # for i in range(L): # (L, C)
+    #     write_fun(model_tensors[f"transformer.h.{i}.ln_1.bias"], file)
     for i in range(L): # (L, 3C, C)
         write_fun(model_tensors[f"transformer.h.{i}.attn.c_attn.weight"], file)
     for i in range(L): # (L, 3C)
@@ -417,8 +499,8 @@ def write_tensors(model_tensors, L, file, dtype):
         write_fun(model_tensors[f"transformer.h.{i}.attn.c_proj.bias"], file)
     for i in range(L): # (L, C)
         write_fun(model_tensors[f"transformer.h.{i}.ln_2.weight"], file)
-    for i in range(L): # (L, C)
-        write_fun(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
+    # for i in range(L): # (L, C)
+    #     write_fun(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     for i in range(L): # (L, 4C, C)
         write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
     for i in range(L): # (L, 4C)
