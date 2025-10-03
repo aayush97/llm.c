@@ -40,6 +40,7 @@ import torch.distributed as dist
 # PyTorch nn.Module definitions for the GPT-2 model
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["TIKTOKEN_CACHE_DIR"] = './tiktoken'
 
 class NewGELU(nn.Module):
     """Careful there are a few versions of GeLU, this one is the exact one used by OpenAI"""
