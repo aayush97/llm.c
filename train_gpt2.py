@@ -167,20 +167,20 @@ class CausalSelfAttention(nn.Module):
         y = self.c_proj(y)
         return y
 
-class MLP(nn.Module):
 
+class MLP(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd)
-        self.gelu    = NewGELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd)
-        self.c_proj.LLMC_RESIDUAL_SCALE_FLAG = 1
+        self.hidden_size = config.n_embd
+        self.intermediate_size = (config.n_embd//3) * 8
+        self.gate_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False)
+        self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
+        self.act_fn = nn.functional.silu
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        return x
+        down_proj = self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        return down_proj
 
 class Block(nn.Module):
 
@@ -502,13 +502,15 @@ def write_tensors(model_tensors, L, file, dtype):
     # for i in range(L): # (L, C)
     #     write_fun(model_tensors[f"transformer.h.{i}.ln_2.bias"], file)
     for i in range(L): # (L, 4C, C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.weight"], file)
-    for i in range(L): # (L, 4C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
-    for i in range(L): # (L, C, 4C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
-    for i in range(L): # (L, C)
-        write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.gate_proj.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.up_proj.weight"], file)
+        write_fun(model_tensors[f"transformer.h.{i}.mlp.down_proj.weight"], file)
+    # for i in range(L): # (L, 4C)
+    #     write_fun(model_tensors[f"transformer.h.{i}.mlp.c_fc.bias"], file)
+    # for i in range(L): # (L, C, 4C)
+    #     write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.weight"], file)
+    # for i in range(L): # (L, C)
+    #     write_fun(model_tensors[f"transformer.h.{i}.mlp.c_proj.bias"], file)
     write_fun(model_tensors["transformer.ln_f.weight"], file) # (C, )
     write_fun(model_tensors["transformer.ln_f.bias"], file) # (C, )
 
@@ -617,8 +619,8 @@ def write_tokenizer(enc, filename):
 def print0(*args, **kwargs):
     # modified print that only prints from the master process
     # if this is not a distributed run, it's just a print
-    if int(os.environ.get("RANK", 0)) == 0:
-        print(*args, **kwargs)
+    # if int(os.environ.get("RANK", 0)) == 0:
+    print(*args, **kwargs)
 
 if __name__ == "__main__":
     import time
@@ -960,7 +962,8 @@ if __name__ == "__main__":
         # log to logile
         if master_process and logfile is not None:
             with open(logfile, "a") as f:
-                f.write("s:%d trl:%f\n" % (step, lossf))
+                # f.write("s:%d trl:%f\n" % (step, lossf))
+                f.write(f"step {step+1:4d}/{args.num_iterations} | train loss {lossf:.6f} | norm {norm:.4f} | lr {lr:.2e} | ({(t1-t0)*1000:.2f} ms | {tokens_per_second:.0f} tok/s)\n")
 
         # keep track of smooth timings, last 20 iterations
         if step > 0 and step > args.num_iterations - 20:
