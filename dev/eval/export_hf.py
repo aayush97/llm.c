@@ -1,173 +1,243 @@
 """
-Script to convert GPT2 models from llm.c binary format to Hugging Face
+Script to convert modified GPT-2 models from .bin format to Hugging Face Llama format.
 
-It can optinally upload to your account on Hugging Face if you have the CLI:
+This script is designed for the custom model architecture in the modified train_gpt2.py,
+which includes RMSNorm, RoPE, and a SwiGLU MLP. It maps the weights to a
+LlamaForCausalLM model from the Hugging Face transformers library.
+
+It can optionally upload the model to your account on Hugging Face if you have the CLI installed and are logged in:
   pip install -U "huggingface_hub[cli]"
   huggingface-cli login
 
-Export to a local HF model:
-  python export_hf.py --input input_file.bin --output output_dir
-
-Export to a local HF model and also push to your account on Hugging Face:
-  python export_hf.py --input input_file.bin --output output_dir --push true
+Example usage:
+  python export_hf_llama.py --input gpt2_d12_bf16.bin --output my-llama-style-model
 """
 
 import numpy as np
 import torch
-import argparse, sys
-from transformers import GPT2Config, GPT2Tokenizer, GPT2LMHeadModel
+import argparse
+from transformers import LlamaConfig, LlamaForCausalLM, GPT2Tokenizer
 
 # -----------------------------------------------------------------------------
-# Tensor functions for both bfloat16 (from int16) and normal float32
-# Both return float32 tensors
+# Tensor conversion functions for bfloat16 and float32
 
 def tensor_bf16(data_int16, transpose=False):
+    """Converts a numpy array of int16 (representing bfloat16) to a float32 tensor."""
     if transpose:
-        data_int16 = data_int16.transpose(1,0)
-    return torch.tensor(data_int16).view(torch.bfloat16).to(torch.float32)
+        data_int16 = data_int16.transpose(1, 0)
+    return torch.from_numpy(data_int16).view(torch.bfloat16).to(torch.float32)
 
 def tensor_fp32(data_float32, transpose=False):
+    """Converts a numpy array of float32 to a float32 tensor."""
     if transpose:
-        data_float32 = data_float32.transpose(1,0)
-    return torch.tensor(data_float32).view(torch.float32)
+        data_float32 = data_float32.transpose(1, 0)
+    return torch.from_numpy(data_float32).view(torch.float32)
 
 # -----------------------------------------------------------------------------
 # Main conversion function
 
 def convert(filepath, output, push_to_hub=False, out_dtype="bfloat16"):
-    print(f"Converting model {filepath} to {output} in {out_dtype} format and pushing to Hugging Face: {push_to_hub}")
+    """
+    Converts the .bin model file to a Hugging Face compatible format.
+    """
+    print(f"Converting model {filepath} to {output} in {out_dtype} format...")
+    print(f"Push to Hugging Face Hub: {push_to_hub}")
 
-    f = open(filepath, 'rb')
-    # Read in our header, checking the magic number and version
-    # version 3 = fp32, padded vocab
-    # version 5 = bf16, padded vocab
-    model_header = np.frombuffer(f.read(256*4), dtype=np.int32)
+    try:
+        f = open(filepath, 'rb')
+    except FileNotFoundError:
+        print(f"Error: Input file not found at {filepath}")
+        return
+
+    # Read the header to get model configuration
+    model_header = np.frombuffer(f.read(256 * 4), dtype=np.int32)
     if model_header[0] != 20240326:
-        print("ERROR: magic number mismatch in the data .bin file!")
-        exit(1)
+        print("ERROR: Magic number mismatch in the .bin file. Is this a valid model file?")
+        f.close()
+        return
+        
     version = model_header[1]
-    if not version in [3, 5]:
-        print("Bad version in model file")
-        exit(1)
+    if version not in [3, 5]:
+        print(f"ERROR: Unsupported model version: {version}. Only versions 3 (fp32) and 5 (bf16) are supported.")
+        f.close()
+        return
 
-    # Load in our model parameters
-    maxT = model_header[2].item() # max sequence length
-    V = model_header[3].item() # vocab size
-    L =  model_header[4].item() # num layers
-    H = model_header[5].item() # num heads
-    C = model_header[6].item() # channels
-    Vp = model_header[7].item() # padded vocab size
+    # Extract model dimensions from the header
+    maxT = model_header[2].item()  # max sequence length (block_size)
+    V = model_header[3].item()     # vocab size
+    L = model_header[4].item()     # num layers
+    H = model_header[5].item()     # num heads
+    C = model_header[6].item()     # channels (n_embd)
+    Vp = model_header[7].item()    # padded vocab size
 
-    print(f"{version=}, {maxT=}, {V=}, {Vp=}, {L=}, {H=}, {C=}")
+    print(f"Model properties: version={version}, max_seq_len={maxT}, vocab_size={V}, padded_vocab_size={Vp}, layers={L}, heads={H}, channels={C}")
 
-    # Define the shapes of our parameters
-    shapes = {
-        'wte': (Vp, C),
-        'wpe': (maxT, C),
-        'ln1w': (L, C),
-        'ln1b': (L, C),
-        'qkvw': (L, 3 * C, C),
-        'qkvb': (L, 3 * C),
-        'attprojw': (L, C, C),
-        'attprojb': (L, C),
-        'ln2w': (L, C),
-        'ln2b': (L, C),
-        'fcw': (L, 4 * C, C),
-        'fcb': (L, 4 * C),
-        'fcprojw': (L, C, 4 * C),
-        'fcprojb': (L, C),
-        'lnfw': (C,),
-        'lnfb': (C,),
-    }
+    # The MLP intermediate size in the modified train_gpt2.py is non-standard
+    intermediate_size = (C // 3) * 8
 
-    # Load in our weights given our parameter shapes
+    # Determine data type for reading weights
     dtype = np.float32 if version == 3 else np.int16
+    tensor_converter = tensor_fp32 if version == 3 else tensor_bf16
+    
+    # --- 1. Load weights from the .bin file ---
+    # The loading process must match the exact order they were written in train_gpt2.py
+    print("Loading weights from .bin file...")
     w = {}
-    for key, shape in shapes.items():
+    
+    def read_tensor(shape):
         num_elements = np.prod(shape)
         data = np.frombuffer(f.read(num_elements * np.dtype(dtype).itemsize), dtype=dtype)
-        w[key] = data.reshape(shape)
-        # The binary file saves the padded vocab - drop the padding back to GPT2 size
-        if shape[0] == Vp:
-            w[key] = w[key].reshape(shape)[:(V-Vp), :]
-    # Ensure the file is fully read and then close
-    assert f.read() == b''
-    f.close()
+        return data.reshape(shape)
 
-    # Map to our model dict, the tensors at this stage are always fp32
-    mk_tensor = {
-        3 : tensor_fp32,
-        5 : tensor_bf16,
-    }[version]
-    model_dict = {}
-    model_dict['transformer.wte.weight'] = mk_tensor(w['wte'])
-    model_dict['transformer.wpe.weight'] = mk_tensor(w['wpe'])
-    model_dict['lm_head.weight'] = model_dict['transformer.wte.weight'] # Tie weights
+    w['wte'] = read_tensor((Vp, C))
+    w['ln1w'] = read_tensor((L, C))
+    w['qkvw'] = read_tensor((L, 3 * C, C))
+    w['qkvb'] = read_tensor((L, 3 * C)) # Will be discarded as Llama has no bias in attention
+    w['attprojw'] = read_tensor((L, C, C))
+    w['attprojb'] = read_tensor((L, C)) # Will be discarded
+    w['ln2w'] = read_tensor((L, C))
+    
+    # MLP weights are interleaved in the file (gate, up, down for layer 0, then layer 1, etc.)
+    w['gate_projw'], w['up_projw'], w['down_projw'] = [], [], []
     for i in range(L):
-        model_dict[f'transformer.h.{i}.ln_1.weight'] = mk_tensor(w['ln1w'][i])
-        model_dict[f'transformer.h.{i}.ln_1.bias'] = mk_tensor(w['ln1b'][i])
-        model_dict[f'transformer.h.{i}.attn.c_attn.weight'] = mk_tensor(w['qkvw'][i], True)
-        model_dict[f'transformer.h.{i}.attn.c_attn.bias'] = mk_tensor(w['qkvb'][i])
-        model_dict[f'transformer.h.{i}.attn.c_proj.weight'] = mk_tensor(w['attprojw'][i], True)
-        model_dict[f'transformer.h.{i}.attn.c_proj.bias'] = mk_tensor(w['attprojb'][i])
-        model_dict[f'transformer.h.{i}.ln_2.weight'] = mk_tensor(w['ln2w'][i])
-        model_dict[f'transformer.h.{i}.ln_2.bias'] = mk_tensor(w['ln2b'][i])
-        model_dict[f'transformer.h.{i}.mlp.c_fc.weight'] = mk_tensor(w['fcw'][i], True)
-        model_dict[f'transformer.h.{i}.mlp.c_fc.bias'] = mk_tensor(w['fcb'][i])
-        model_dict[f'transformer.h.{i}.mlp.c_proj.weight'] = mk_tensor(w['fcprojw'][i], True)
-        model_dict[f'transformer.h.{i}.mlp.c_proj.bias'] = mk_tensor(w['fcprojb'][i])
-    model_dict['transformer.ln_f.weight'] = mk_tensor(w['lnfw'])
-    model_dict['transformer.ln_f.bias'] = mk_tensor(w['lnfb'])
+        w['gate_projw'].append(read_tensor((intermediate_size, C)))
+        w['up_projw'].append(read_tensor((intermediate_size, C)))
+        w['down_projw'].append(read_tensor((C, intermediate_size)))
+    
+    w['lnfw'] = read_tensor((C,))
+    w['lnfb'] = read_tensor((C,)) # Will be discarded (final norm is RMSNorm)
 
-    # Create a GPT-2 model instance, in the requested dtype
-    config = GPT2Config(vocab_size = V,
-                        n_positions = maxT,
-                        n_ctx = maxT,
-                        n_embd = C,
-                        n_layer = L,
-                        n_head = H)
-    model = GPT2LMHeadModel(config)
+    # Ensure the file is fully read and then close
+    if f.read() != b'':
+        print("WARNING: Extra data found at the end of the file.")
+    f.close()
+    print("Finished loading weights.")
+    
+    # --- 2. Create a Hugging Face Llama model and map the weights ---
+    print("Creating Hugging Face Llama model and mapping weights...")
+    model_dict = {}
+    
+    # Unpad the vocabulary weights
+    wte_unpadded = tensor_converter(w['wte'])[:V, :]
+    model_dict['model.embed_tokens.weight'] = wte_unpadded
+    model_dict['lm_head.weight'] = wte_unpadded  # Tie weights
+
+    for i in range(L):
+        # Attention weights
+        # FIX: Removed `transpose=True`. The tensor shape is (3*C, C), which correctly splits into three (C, C) tensors along dim=0.
+        q, k, v = torch.split(tensor_converter(w['qkvw'][i]), C, dim=0)
+        model_dict[f'model.layers.{i}.self_attn.q_proj.weight'] = q
+        model_dict[f'model.layers.{i}.self_attn.k_proj.weight'] = k
+        model_dict[f'model.layers.{i}.self_attn.v_proj.weight'] = v
+        # FIX: Removed `transpose=True`. o_proj weight is already in the correct (C, C) format.
+        model_dict[f'model.layers.{i}.self_attn.o_proj.weight'] = tensor_converter(w['attprojw'][i])
+        
+        # MLP weights
+        # FIX: Removed `transpose=True`. Weights are already in the correct (out, in) format.
+        model_dict[f'model.layers.{i}.mlp.gate_proj.weight'] = tensor_converter(w['gate_projw'][i])
+        model_dict[f'model.layers.{i}.mlp.up_proj.weight'] = tensor_converter(w['up_projw'][i])
+        model_dict[f'model.layers.{i}.mlp.down_proj.weight'] = tensor_converter(w['down_projw'][i])
+
+        # RMSNorm weights
+        model_dict[f'model.layers.{i}.input_layernorm.weight'] = tensor_converter(w['ln1w'][i])
+        model_dict[f'model.layers.{i}.post_attention_layernorm.weight'] = tensor_converter(w['ln2w'][i])
+        
+    # Final normalization layer
+    model_dict['model.norm.weight'] = tensor_converter(w['lnfw'])
+    
+    print("NOTE: Discarding attention biases and final layernorm bias as they are not used in the Llama architecture.")
+
+    # --- 3. Configure, create, and save the final model ---
+    config = LlamaConfig(
+        vocab_size=V,
+        max_position_embeddings=maxT,
+        hidden_size=C,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=L,
+        num_attention_heads=H,
+        hidden_act="silu", # Corresponds to SiLU/Swish activation in SwiGLU
+        rms_norm_eps=1e-6, # From train_gpt2.py
+        rope_theta=10000.0, # From train_gpt2.py
+        tie_word_embeddings=True,
+    )
+    
+    print("Initializing LlamaForCausalLM model...")
+    model = LlamaForCausalLM(config)
     if out_dtype == "bfloat16":
         model = model.to(torch.bfloat16)
 
-    # Set the model dict and save
-    model.load_state_dict(model_dict)
+    # Load the state dictionary and handle any mismatches
+    load_result = model.load_state_dict(model_dict, strict=False)
+    if load_result.missing_keys:
+        print("WARNING: Missing keys during model load:", load_result.missing_keys)
+    if load_result.unexpected_keys:
+        print("WARNING: Unexpected keys during model load:", load_result.unexpected_keys)
+
+    print(f"Saving model to directory: {output}")
     model.save_pretrained(output, max_shard_size="5GB", safe_serialization=True)
 
-    # Copy over a standard gpt2 tokenizer
+    # Save the tokenizer (using the standard gpt2 tokenizer as per the training script)
+    print("Saving tokenizer...")
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.save_pretrained(output)
 
+    print("Conversion complete!")
+
     if push_to_hub:
-        print(f"Uploading {output} to Hugging Face")
-        model.push_to_hub(output)
-        tokenizer.push_to_hub(output)
+        print(f"Uploading {output} to Hugging Face Hub...")
+        try:
+            model.push_to_hub(output)
+            tokenizer.push_to_hub(output)
+            print("Upload successful.")
+        except Exception as e:
+            print(f"An error occurred during upload: {e}")
 
 def spin(output):
+    """A quick test function to generate text from the exported model."""
+    print("\n" + "-"*80)
     print("Taking the exported model for a spin...")
     print('-'*80)
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(output)
-    model = AutoModelForCausalLM.from_pretrained(output, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16, device_map='cuda')
-    model.eval()
-    tokens = tokenizer.encode("During photosynthesis in green plants", return_tensors="pt")
-    tokens = tokens.to('cuda')
-    output = model.generate(tokens, max_new_tokens=64, repetition_penalty=1.3)
-    samples = tokenizer.batch_decode(output)
-    for sample in samples:
-        print('-'*30)
+    try:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+        
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"Using device: {device}")
+        
+        tokenizer = AutoTokenizer.from_pretrained(output)
+        model = AutoModelForCausalLM.from_pretrained(
+            output, 
+            torch_dtype=torch.bfloat16 if device == 'cuda' else torch.float32, 
+            device_map=device
+        )
+        model.eval()
+
+        prompt = "In a world where magic is real,"
+        tokens = tokenizer.encode(prompt, return_tensors="pt").to(device)
+        
+        with torch.no_grad():
+            output_tokens = model.generate(tokens, max_new_tokens=64, repetition_penalty=1.2, top_k=40, do_sample=True)
+        
+        sample = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+        print("\n--- GENERATED SAMPLE ---")
         print(sample)
+        print("------------------------")
+    except ImportError:
+        print("Could not import transformers. Skipping model test.")
+    except Exception as e:
+        print(f"An error occurred during the test run: {e}")
 
 # -----------------------------------------------------------------------------
 
-if __name__== '__main__':
-    parser=argparse.ArgumentParser()
-    parser.add_argument("--input", "-i", help="The name of the llm.c model.bin file", type=str, required=True)
-    parser.add_argument("--output","-o",  help="The Hugging Face output model directory", type=str, required=True)
-    parser.add_argument("--dtype", "-d", help="Output as either float32 or bfloat16 (default)", type=str, default="bfloat16")
-    parser.add_argument("--push", "-p", help="Push the model to your Hugging Face account", type=bool, default=False)
-    parser.add_argument("--spin", "-s", help="Take the model for a spin at the end?", type=bool, default=True)
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Convert custom llm.c .bin models to HF Llama format.")
+    parser.add_argument("--input", "-i", help="The name of the input .bin model file", type=str, required=True)
+    parser.add_argument("--output", "-o", help="The Hugging Face output model directory", type=str, required=True)
+    parser.add_argument("--dtype", "-d", help="Output dtype: float32 or bfloat16 (default)", type=str, default="bfloat16", choices=["float32", "bfloat16"])
+    parser.add_argument("--push", "-p", help="Push the model to your Hugging Face account", action="store_true")
+    parser.add_argument("--no-spin", help="Do not run a test generation at the end", action="store_true")
     args = parser.parse_args()
+    
     convert(args.input, args.output, args.push, args.dtype)
-    if args.spin:
+    if not args.no_spin:
         spin(args.output)
+
